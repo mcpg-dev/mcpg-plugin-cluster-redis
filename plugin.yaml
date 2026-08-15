@@ -1,0 +1,21 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.cluster.redis
+name: Redis Cluster Coordinator
+license: BUSL-1.1
+description: |
+  Redis-backed cluster plugin. SETNX + Lua for fence-token
+  leases (matches the lease semantics in `mcpg-state-redis::RedisLock`),
+  PUBLISH/PSUBSCRIBE for pub/sub, and a SET-with-TTL self-registration
+  scheme for peer discovery. Ships full primitive accessors
+  (`key_value_store` / `pub_sub` / `lease` / `watch`, the last via
+  Redis streams XADD/XREAD) per the cluster-backbone refactor.
+  Deferred to v0.2: PSUBSCRIBE wildcard topics, keyspace-event-driven
+  `watch_peers`, and a testcontainers equivalence run.
+class: cluster
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  - network_outbound
+provides:
+  - cache
+  - kv
