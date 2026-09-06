@@ -8,9 +8,24 @@ use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use tokio::sync::Mutex;
 
-use super::watch::{
-    DELETE_WITH_WATCH_LUA, PUT_IF_ABSENT_WITH_WATCH_LUA, PUT_WITH_WATCH_LUA, ttl_arg,
-};
+/// `INCRBY` + optional `PEXPIRE` in one server-side script, so the
+/// add-and-get and its sliding TTL re-arm are atomic against every
+/// other client. A non-integer value (or i64 overflow) makes `INCRBY`
+/// raise; the sentinel prefix lets the host map that onto
+/// `ClusterError::Precondition` instead of a generic backend error.
+const INCR_LUA: &str = r"
+local ok, ret = pcall(redis.call, 'INCRBY', KEYS[1], ARGV[1])
+if not ok then
+  local detail = ''
+  if type(ret) == 'table' and ret.err then detail = ': ' .. ret.err end
+  return redis.error_reply('MCPG_KV_INCR_PRECONDITION' .. detail)
+end
+local ttl = tonumber(ARGV[2])
+if ttl and ttl > 0 then
+  redis.call('PEXPIRE', KEYS[1], ttl)
+end
+return ret
+";
 
 /// Redis-backed KV state. Holds a `ConnectionManager` for automatic
 /// reconnect; clones share the underlying connection.
@@ -21,12 +36,6 @@ pub struct RedisKv {
 struct RedisKvInner {
     conn: Mutex<ConnectionManager>,
     key_prefix: String,
-    /// When `Some`, every `put` / `delete` runs through a Lua script
-    /// that also `XADD`s the operation to this stream. The matching
-    /// [`crate::RedisWatch`] subscribes to the same stream. `None`
-    /// disables watch publishing entirely (zero-cost path — the
-    /// behaviour when no `Watch` primitive is wired).
-    watch_stream: Option<String>,
 }
 
 impl std::fmt::Debug for RedisKv {
@@ -38,23 +47,14 @@ impl std::fmt::Debug for RedisKv {
 }
 
 impl RedisKv {
-    /// Construct a `RedisKv` over an already-built `ConnectionManager`
-    /// that also publishes `put` / `delete` operations to a watch
-    /// stream. Pair with a matching [`super::RedisWatch`] over the
-    /// same stream key so subscribers see the events. The default
-    /// stream key is `<key_prefix>:watch-stream` — use
-    /// [`default_watch_stream_key`] to compute it from the same
-    /// `key_prefix`.
-    pub fn with_connection_manager_and_watch(
-        conn: ConnectionManager,
-        key_prefix: String,
-        watch_stream: String,
-    ) -> Self {
+    /// Construct a `RedisKv` over an already-built `ConnectionManager`.
+    /// Used by `mcpg-plugin-cluster-redis` to share its single
+    /// connection across the coordinator + the primitive accessors.
+    pub fn with_connection_manager(conn: ConnectionManager, key_prefix: String) -> Self {
         Self {
             inner: Arc::new(RedisKvInner {
                 conn: Mutex::new(conn),
                 key_prefix,
-                watch_stream: Some(watch_stream),
             }),
         }
     }
@@ -101,21 +101,6 @@ impl KeyValueStore for RedisKv {
         let full = self.full_key(key);
         let mut conn = self.inner.conn.lock().await;
         let bytes = value.to_vec();
-        // When watch is wired, every `put` runs through a Lua
-        // script that does SET + XADD atomically. The 2x overhead
-        // on writes is the documented trade-off for free reads
-        // (watchers don't need to GET after the event arrives).
-        if let Some(stream) = &self.inner.watch_stream {
-            let _: i64 = redis::Script::new(PUT_WITH_WATCH_LUA)
-                .key(&full)
-                .key(stream)
-                .arg(bytes)
-                .arg(ttl_arg(ttl))
-                .invoke_async(&mut *conn)
-                .await
-                .map_err(redis_err)?;
-            return Ok(());
-        }
         match ttl {
             Some(d) => {
                 let ms: u64 = d.as_millis().max(1).min(u64::MAX as u128) as u64;
@@ -142,17 +127,6 @@ impl KeyValueStore for RedisKv {
         // Atomic single-winner claim via `SET ... NX`. Redis auto-expires
         // keys, so a lapsed prior claim is already gone → NX naturally
         // succeeds (expired == absent).
-        if let Some(stream) = &self.inner.watch_stream {
-            let claimed: i64 = redis::Script::new(PUT_IF_ABSENT_WITH_WATCH_LUA)
-                .key(&full)
-                .key(stream)
-                .arg(bytes)
-                .arg(ttl_arg(ttl))
-                .invoke_async(&mut *conn)
-                .await
-                .map_err(redis_err)?;
-            return Ok(claimed == 1);
-        }
         let mut cmd = redis::cmd("SET");
         cmd.arg(&full).arg(bytes).arg("NX");
         if let Some(d) = ttl {
@@ -167,18 +141,6 @@ impl KeyValueStore for RedisKv {
     async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
         let full = self.full_key(key);
         let mut conn = self.inner.conn.lock().await;
-        if let Some(stream) = &self.inner.watch_stream {
-            // Lua script: GET + DEL + XADD with prior value, all
-            // atomic. Returns 1 when the key existed (matches the
-            // trait contract).
-            let removed: i64 = redis::Script::new(DELETE_WITH_WATCH_LUA)
-                .key(&full)
-                .key(stream)
-                .invoke_async(&mut *conn)
-                .await
-                .map_err(redis_err)?;
-            return Ok(removed > 0);
-        }
         let n: i64 = conn.del(&full).await.map_err(redis_err)?;
         Ok(n > 0)
     }
@@ -259,6 +221,37 @@ impl KeyValueStore for RedisKv {
                 Ok(true)
             }
         }
+    }
+
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        let full = self.full_key(key);
+        let mut conn = self.inner.conn.lock().await;
+        // 0 == "leave any existing TTL alone" inside the script.
+        let ttl_ms: i64 = match ttl {
+            Some(d) => d.as_millis().max(1).min(i64::MAX as u128) as i64,
+            None => 0,
+        };
+        let r: Result<i64, redis::RedisError> = redis::Script::new(INCR_LUA)
+            .key(&full)
+            .arg(delta)
+            .arg(ttl_ms)
+            .invoke_async(&mut *conn)
+            .await;
+        r.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("MCPG_KV_INCR_PRECONDITION") {
+                ClusterError::Precondition {
+                    reason: format!("redis incr `{key}`: {msg}"),
+                }
+            } else {
+                redis_err(e)
+            }
+        })
     }
 }
 

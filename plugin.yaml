@@ -5,12 +5,17 @@ license: BUSL-1.1
 description: |
   Redis-backed cluster plugin. SETNX + Lua for fence-token
   leases (matches the lease semantics in `mcpg-state-redis::RedisLock`),
-  PUBLISH/PSUBSCRIBE for pub/sub, and a SET-with-TTL self-registration
-  scheme for peer discovery. Ships full primitive accessors
-  (`key_value_store` / `pub_sub` / `lease` / `watch`, the last via
-  Redis streams XADD/XREAD) per the cluster-backbone refactor.
-  Deferred to v0.2: PSUBSCRIBE wildcard topics, keyspace-event-driven
-  `watch_peers`, and a testcontainers equivalence run.
+  PUBLISH/SUBSCRIBE for pub/sub, and a SET-with-TTL self-registration
+  scheme for peer discovery. Ships the `key_value_store` (GET/SET with
+  TTL, `INCRBY` atomic incr) and `pub_sub` primitive accessors.
+  Bus semantics: Redis PUBLISH fans out to every subscriber — a
+  subscribe queue group is accepted but ignored (documented broadcast,
+  no per-group balancing) — and there is no per-message payload cap.
+  Connects over TLS with a `rediss://` URL (rustls; system trust roots
+  by default, `tls.ca_cert` adds a private-CA root). The testcontainers
+  equivalence run lives in `tests/equivalence.rs` (gated on
+  `--features integration-tests`). Deferred to v0.2: PSUBSCRIBE
+  wildcard topics and keyspace-event-driven `watch_peers`.
 class: cluster
 runtime: native-cdylib-v1
 protocol_version: "1.0"
@@ -19,3 +24,4 @@ required_capabilities:
 provides:
   - cache
   - kv
+  - bus

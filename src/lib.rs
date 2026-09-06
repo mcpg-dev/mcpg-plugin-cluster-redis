@@ -2,8 +2,6 @@
 //! `cluster` plugin (v0.1).
 //!
 //! Sibling of:
-//!   - `mcpg-plugin-cluster-etcd`
-//!   - `mcpg-plugin-cluster-consul`
 //!   - `mcpg-plugin-cluster-nats`
 //!
 //! Operators select this coordinator via:
@@ -23,18 +21,18 @@
 //! |---|---|
 //! | `acquire_lock` / `acquire_leadership` | Lua `SET NX PX` + `INCR` for fence; renew via `if GET == holder then PEXPIRE` |
 //! | `publish` / `subscribe`               | Native `PUBLISH` / `SUBSCRIBE` |
+//! | `key_value_store()`                   | GET/SET/DEL/SCAN + `INCRBY` (atomic `incr`) |
+//! | `pub_sub()`                           | `PUBLISH` / `PSUBSCRIBE` (broadcast; queue group ignored) |
 //! | `list_peers`                          | `SCAN MATCH <prefix>peers/*` + `MGET` |
 //! | `watch_peers`                         | Polling diff against `list_peers` snapshots |
 //!
-//! Lease semantics match `mcpg-state-redis::RedisLock` so an operator
-//! who already runs Redis for state can reuse the same instance for
-//! cluster coordination.
+//! TLS: a `rediss://` URL connects over rustls — system trust roots by
+//! default, `tls.ca_cert` adds a private-CA root.
 //!
 //! # Deferred to v0.2
 //!
 //! - Native PSUBSCRIBE wildcard topic patterns.
 //! - Keyspace-event-driven `watch_peers` (vs polling).
-//! - testcontainers-backed equivalence test against a real Redis.
 
 mod config;
 mod envelope;
@@ -51,14 +49,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use mcpg_cluster_api::{
     BoxActiveLease, BoxPeerEventStream, BoxPublishedMessageStream, ClusterBackend, ClusterError,
-    ClusterNodeInfo, ClusterPeer, KeyValueStore, Lease, PeerEvent, PubSub, Watch,
+    ClusterNodeInfo, ClusterPeer, KeyValueStore, PeerEvent, PubSub,
 };
 use mcpg_plugin_protocol::{PluginClass, PluginManifest};
 use mcpg_plugin_sdk::declare_plugin;
 use mcpg_plugin_sdk::ffi::{SyncClusterBackend, WatchHandleBox};
 use redis::aio::ConnectionManager;
 
-use crate::state::{RedisKv, RedisLock, RedisTopicBus, RedisWatch, default_watch_stream_key};
+use crate::state::{RedisKv, RedisTopicBus};
 use tokio::runtime::Runtime;
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 use tokio::task::AbortHandle;
@@ -85,9 +83,9 @@ struct Inner {
     /// because `ConnectionManager::new` aggressively retries +
     /// errors when Redis is unreachable; making the coordinator
     /// boot-time-tolerant matters for clusters where the gateway
-    /// starts before Redis (and matches the consul + etcd
-    /// coordinators' "config-validated, backend connected on
-    /// first op" behaviour).
+    /// starts before Redis (and matches the nats coordinator's
+    /// "config-validated, backend connected on first op"
+    /// behaviour).
     conn_cell: OnceCell<lease::SharedConn>,
     /// Lazily-initialized primitive accessors. Filled on the first
     /// successful `get_or_init_conn` call (which both the
@@ -123,12 +121,7 @@ impl Inner {
 /// returned `Arc`-cloned from each accessor call.
 struct RedisPrimitives {
     kv: Arc<RedisKv>,
-    lease: Arc<RedisLock>,
     pub_sub: Arc<RedisTopicBus>,
-    /// `Watch` over a Redis Stream the matching `kv` populates as
-    /// a side-effect of every `put` / `delete`. Subscribers
-    /// `XREAD BLOCK` the stream + filter by prefix.
-    watch: Arc<RedisWatch>,
 }
 
 impl RedisBackend {
@@ -159,6 +152,19 @@ impl RedisBackend {
     }
 
     fn from_validated_config(cfg: RedisBackendConfig) -> Self {
+        // rustls needs a process-default CryptoProvider before the first
+        // `rediss://` handshake; the dep graph compiles in both `ring` and
+        // `aws-lc-rs`, so it cannot auto-pick one and panics instead. A
+        // cdylib's rustls statics belong to its own linkage unit — the host
+        // binary's installer can't reach them — so install here, Once-guarded;
+        // if some other code in this linkage installed first, that one wins.
+        {
+            static TLS_PROVIDER: std::sync::Once = std::sync::Once::new();
+            TLS_PROVIDER.call_once(|| {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+            });
+        }
+
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -189,7 +195,27 @@ impl RedisBackend {
             if cfg.password.is_some() {
                 info.redis.password = cfg.password.clone();
             }
-            redis::Client::open(info).unwrap_or_else(|err| {
+            // A custom CA rides `build_with_tls`, which stamps the rustls
+            // params into the connection address — every connection built
+            // from this client (multiplexed manager AND the per-subscriber
+            // pub/sub connections) verifies against it. Without a custom
+            // CA a `rediss://` URL still negotiates rustls, against the
+            // system trust roots. PEM resolution failures (missing file,
+            // malformed cert) refuse to load, same posture as a bad URL.
+            let root_ca = cfg.tls_root_cert_pem().unwrap_or_else(|err| {
+                panic!("redis cluster: {err}. Refusing to load with unusable TLS config.")
+            });
+            let built = match root_ca {
+                Some(pem) => redis::Client::build_with_tls(
+                    info,
+                    redis::TlsCertificates {
+                        client_tls: None,
+                        root_cert: Some(pem),
+                    },
+                ),
+                None => redis::Client::open(info),
+            };
+            built.unwrap_or_else(|err| {
                 panic!(
                     "redis cluster: failed to open client `{}`: {err}",
                     crate::config::redact_redis_url(&cfg.url)
@@ -214,10 +240,12 @@ impl RedisBackend {
                 required_capabilities: Vec::new(),
                 tags: Vec::new(),
                 // Slot roles (cache/kv/bus), not primitive accessors.
-                // Redis backs `kv` (string keys + TTL) and `cache` (same
-                // primitive, eviction semantics for the cache slot). No
-                // native `bus` today — wire bus to NATS/single-node.
-                provides: vec!["cache".into(), "kv".into()],
+                // Redis backs `kv` (string keys + TTL), `cache` (same
+                // primitive, eviction semantics for the cache slot) and
+                // `bus` (native PUBLISH/SUBSCRIBE via the `pub_sub()`
+                // primitive — broadcast fan-out; subscribe queue groups
+                // are accepted but ignored).
+                provides: vec!["cache".into(), "kv".into(), "bus".into()],
                 provides_schemes: Vec::new(),
                 module_path_prefix: ::std::module_path!()
                     .split("::")
@@ -349,37 +377,16 @@ async fn get_or_init_conn(inner: &Arc<Inner>) -> Result<lease::SharedConn, Clust
                 (*guard).clone()
             };
             let prefix = inner.config.key_prefix.clone();
-            // Wire the watch stream. `kv` writes `put` / `delete`
-            // ops to the stream via Lua scripts; `watch`
-            // subscribers read from it via XREAD BLOCK. One stream
-            // per cluster.redis instance; subscribers filter by
-            // prefix client-side.
-            let watch_stream = default_watch_stream_key(&prefix);
-            let kv = Arc::new(RedisKv::with_connection_manager_and_watch(
-                mgr.clone(),
-                prefix.clone(),
-                watch_stream.clone(),
-            ));
-            let lease = Arc::new(RedisLock::with_connection_manager(
+            let kv = Arc::new(RedisKv::with_connection_manager(
                 mgr.clone(),
                 prefix.clone(),
             ));
             let pub_sub = Arc::new(RedisTopicBus::with_client_and_connection(
                 inner.client.clone(),
                 mgr.clone(),
-                prefix.clone(),
-            ));
-            let watch = Arc::new(RedisWatch::with_client(
-                inner.client.clone(),
                 prefix,
-                watch_stream,
             ));
-            Ok::<RedisPrimitives, ClusterError>(RedisPrimitives {
-                kv,
-                lease,
-                pub_sub,
-                watch,
-            })
+            Ok::<RedisPrimitives, ClusterError>(RedisPrimitives { kv, pub_sub })
         })
         .await?;
     Ok(Arc::clone(conn))
@@ -447,20 +454,6 @@ impl ClusterBackend for RedisBackend {
             .primitives
             .get()
             .map(|p| Arc::clone(&p.pub_sub) as Arc<dyn PubSub>)
-    }
-
-    fn lease(&self) -> Option<Arc<dyn Lease>> {
-        self.inner
-            .primitives
-            .get()
-            .map(|p| Arc::clone(&p.lease) as Arc<dyn Lease>)
-    }
-
-    fn watch(&self) -> Option<Arc<dyn Watch>> {
-        self.inner
-            .primitives
-            .get()
-            .map(|p| Arc::clone(&p.watch) as Arc<dyn Watch>)
     }
 
     async fn node_info(&self) -> ClusterNodeInfo {
@@ -672,6 +665,10 @@ impl ClusterBackend for RedisBackend {
     async fn subscribe(
         &self,
         topic: &str,
+        // Redis pub/sub has no server-side consumer groups on PUBLISH
+        // channels: every subscriber receives every message, so a queue
+        // group is accepted but ignored (declared broadcast semantics —
+        // asserted by the equivalence suite's bus matrix).
         _group: Option<&str>,
         routing_key: Option<&str>,
     ) -> Result<BoxPublishedMessageStream, ClusterError> {
@@ -923,6 +920,13 @@ impl SyncClusterBackend for RedisBackend {
             .runtime
             .block_on(async { kv.expire(key, ttl_from_ms(ttl_ms)).await })
     }
+
+    fn kv_incr(&self, key: &str, delta: i64, ttl_ms: Option<u64>) -> Result<i64, ClusterError> {
+        let kv = self.require_kv()?;
+        self.inner
+            .runtime
+            .block_on(async { kv.incr(key, delta, ttl_from_ms(ttl_ms)).await })
+    }
 }
 
 /// Whole-millisecond TTL → `Duration` (None == no TTL).
@@ -1009,6 +1013,10 @@ mod tests {
         assert_eq!(manifest.id, PLUGIN_ID);
         assert!(matches!(manifest.plugin_class, PluginClass::Cluster));
         assert_eq!(manifest.protocol_version, "1.0");
+        // All three slot roles: cache + kv (string primitive) and bus
+        // (native pub/sub) — matches plugin.yaml and the gateway's
+        // static wiring table, cross-checked fail-closed at boot.
+        assert_eq!(manifest.provides, vec!["cache", "kv", "bus"]);
         // Capabilities live on PluginRegistration.capabilities;
         // manifest is display-only.
     }
@@ -1072,5 +1080,75 @@ mod tests {
         let plugin = RedisBackend::from_validated_config(build_config());
         let peers = SyncClusterBackend::list_peers(&plugin);
         assert!(peers.is_empty());
+    }
+
+    // TLS coverage boundary: these tests exercise the whole client-side
+    // TLS setup — config validation, PEM resolution, and the rustls
+    // root-store construction inside `redis::Client::build_with_tls` —
+    // against an unreachable endpoint. The live handshake itself
+    // (server-cert verification against the custom CA, hostname check)
+    // needs a TLS-terminating Redis, which no CI lane runs; the
+    // testcontainers equivalence suite uses the stock plaintext
+    // `redis:7-alpine` image.
+
+    /// Same static PEM as the config tests — parsing only, never a
+    /// handshake, so expiry is irrelevant.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBhDCCASmgAwIBAgIUfIlbzDivcYV5JW8aXnt92hTShw0wCgYIKoZIzj0EAwIw\n\
+FzEVMBMGA1UEAwwMbWNwZy10ZXN0LWNhMB4XDTI2MDkwNDIwMzk1N1oXDTM2MDkw\n\
+MTIwMzk1N1owFzEVMBMGA1UEAwwMbWNwZy10ZXN0LWNhMFkwEwYHKoZIzj0CAQYI\n\
+KoZIzj0DAQcDQgAEmuOrY8CLXKq8f3BGgSeugoQtwMfkzdztxUX8gRbjXlAdo9CP\n\
+Q6mPxFwwVJa6vkSUagc4XMFTwPR0XKXnyRSeYqNTMFEwHQYDVR0OBBYEFIkT1jxH\n\
+2Q1g1AuYGYCNCSn2ItU2MB8GA1UdIwQYMBaAFIkT1jxH2Q1g1AuYGYCNCSn2ItU2\n\
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAL5syMJr7h2NAxJW\n\
+Os4yEYf81h/OzOGhG6SHRFnkeaiSAiEAjxmd81w+EdoDmzCJrBrZBFklpK4K5rkb\n\
+sEkUiIkzAWo=\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn rediss_with_custom_ca_builds_client() {
+        // `build_with_tls` parses the CA PEM and builds the rustls root
+        // store at construction time (no network I/O), so a valid custom
+        // CA must produce a loadable coordinator.
+        let cfg = RedisBackendConfig::parse(
+            &json!({
+                "url": "rediss://127.0.0.1:1",
+                "node_id": "node-tls",
+                "tls": {"ca_cert": TEST_CA_PEM}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let plugin = RedisBackend::from_validated_config(cfg);
+        let info = SyncClusterBackend::node_info(&plugin);
+        assert_eq!(info.node_id, "node-tls");
+        assert_eq!(info.address, "rediss://127.0.0.1:1");
+    }
+
+    #[test]
+    fn rediss_without_tls_block_builds_client_on_system_roots() {
+        let cfg = RedisBackendConfig::parse(
+            &json!({"url": "rediss://127.0.0.1:1", "node_id": "node-tls-sys"}).to_string(),
+        )
+        .unwrap();
+        let plugin = RedisBackend::from_validated_config(cfg);
+        assert_eq!(
+            SyncClusterBackend::node_info(&plugin).node_id,
+            "node-tls-sys"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to open client")]
+    fn malformed_ca_cert_refuses_to_load() {
+        let cfg = RedisBackendConfig::parse(
+            &json!({
+                "url": "rediss://127.0.0.1:1",
+                "tls": {"ca_cert": "-----BEGIN CERTIFICATE-----\ngarbage\n-----END CERTIFICATE-----\n"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _ = RedisBackend::from_validated_config(cfg);
     }
 }

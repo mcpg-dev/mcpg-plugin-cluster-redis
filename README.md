@@ -8,8 +8,8 @@ tokens, key-change watch, and peer discovery — over a single Redis instance, s
 replicas can share sessions, leases, bundle-reload events, and approval
 notifications. Gateway capabilities inherit its primitives directly, so a single
 Redis instance backs both shared gateway state and cluster coordination. Reach
-for it when you already run Redis and do not want to stand up etcd, Consul, or
-NATS purely to cluster the gateway.
+for it when you already run Redis and do not want to stand up NATS purely to
+cluster the gateway.
 
 ## What it does
 - Implements the four coordination primitives — `KeyValueStore`, `PubSub`,
@@ -143,5 +143,4 @@ revocations. See <https://mcpg.dev/docs/security/plugin-security>.
 ## See also
 - Clustering a gateway fleet: <https://mcpg.dev/docs/self-hosting/clustering>
 - Plugin classes and the ABI: <https://mcpg.dev/docs/plugins/plugins-and-protocol>
-- Sibling coordinators: `libs/plugins/cluster/etcd`, `libs/plugins/cluster/consul`,
-  `libs/plugins/cluster/nats`
+- Sibling coordinator: `libs/plugins/cluster/nats`

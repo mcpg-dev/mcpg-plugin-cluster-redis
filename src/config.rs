@@ -23,6 +23,15 @@ pub struct RedisBackendConfig {
     #[serde(default)]
     pub password: Option<String>,
 
+    /// Optional TLS knobs for a `rediss://` URL. A `rediss://` URL alone
+    /// connects with rustls against the SYSTEM trust roots; `ca_cert`
+    /// adds a private-CA root instead. Rejected when `url` uses the
+    /// plaintext `redis://` scheme (fail-closed — a `tls` block that
+    /// silently did nothing would misstate the wire posture). Server-cert
+    /// verification is always on (no skip-verify knob).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+
     /// Prefix prepended to every key the coordinator owns. Lets
     /// operators run multiple gateways against one Redis instance
     /// by giving each a distinct namespace.
@@ -72,6 +81,32 @@ pub struct RedisBackendConfig {
     pub service_name: String,
 }
 
+/// TLS knobs for `rediss://` URLs. Mirrors the nats coordinator
+/// convention: PEM values are either inline (a string starting with
+/// `-----BEGIN`) or a filesystem path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Private-CA root certificate (PEM, inline or path). When absent,
+    /// the system trust roots are used. Server-cert verification is
+    /// always on.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+}
+
+/// Resolve a PEM config value: inline PEM text is used as-is, anything
+/// else is read as a filesystem path.
+fn resolve_pem(value: &str) -> Result<Vec<u8>, ConfigError> {
+    if value.trim_start().starts_with("-----BEGIN") {
+        Ok(value.as_bytes().to_vec())
+    } else {
+        std::fs::read(value).map_err(|source| ConfigError::TlsFileRead {
+            path: value.to_owned(),
+            source,
+        })
+    }
+}
+
 impl std::fmt::Debug for RedisBackendConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Manual impl so the `password` (and any credential in `url`) is
@@ -80,6 +115,7 @@ impl std::fmt::Debug for RedisBackendConfig {
             .field("url", &redact_redis_url(&self.url))
             .field("username", &self.username)
             .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("tls", &self.tls)
             .field("key_prefix", &self.key_prefix)
             .field("lease_ttl_ms", &self.lease_ttl_ms)
             .field("peer_ttl_ms", &self.peer_ttl_ms)
@@ -154,6 +190,16 @@ pub enum ConfigError {
     EmptyUrl,
     #[error("cluster.redis: url must start with redis:// or rediss://")]
     InvalidUrlScheme,
+    #[error(
+        "cluster.redis: a `tls` block requires a `rediss://` url — a plaintext `redis://` \
+         connection would silently ignore it (use `rediss://`, or drop `tls`)"
+    )]
+    TlsRequiresTlsScheme,
+    #[error("cluster.redis: tls: failed to read PEM file `{path}`: {source}")]
+    TlsFileRead {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("cluster.redis: key_prefix is empty (use a distinct namespace per deployment)")]
     EmptyKeyPrefix,
     #[error("cluster.redis: lease_ttl_ms must be > 0")]
@@ -179,6 +225,9 @@ impl RedisBackendConfig {
         }
         if !self.url.starts_with("redis://") && !self.url.starts_with("rediss://") {
             return Err(ConfigError::InvalidUrlScheme);
+        }
+        if self.tls.is_some() && !self.url.starts_with("rediss://") {
+            return Err(ConfigError::TlsRequiresTlsScheme);
         }
         if self.key_prefix.is_empty() {
             return Err(ConfigError::EmptyKeyPrefix);
@@ -218,6 +267,16 @@ impl RedisBackendConfig {
     pub fn effective_peer_refresh_interval_ms(&self) -> u64 {
         self.peer_refresh_interval_ms
             .unwrap_or_else(|| (self.peer_ttl_ms / 2).max(1))
+    }
+
+    /// Resolve `tls.ca_cert` to PEM bytes (inline text or file path).
+    /// `Ok(None)` when no custom CA is configured — the rustls
+    /// connection then verifies against the system trust roots.
+    pub(crate) fn tls_root_cert_pem(&self) -> Result<Option<Vec<u8>>, ConfigError> {
+        match self.tls.as_ref().and_then(|t| t.ca_cert.as_deref()) {
+            Some(ca) => Ok(Some(resolve_pem(ca)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -362,6 +421,80 @@ mod tests {
         let err =
             RedisBackendConfig::parse(&json!({"url": "http://r:6379"}).to_string()).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidUrlScheme));
+    }
+
+    /// Static PEM used by the TLS config tests. Only parsing is
+    /// exercised — no handshake — so expiry is irrelevant.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBhDCCASmgAwIBAgIUfIlbzDivcYV5JW8aXnt92hTShw0wCgYIKoZIzj0EAwIw\n\
+FzEVMBMGA1UEAwwMbWNwZy10ZXN0LWNhMB4XDTI2MDkwNDIwMzk1N1oXDTM2MDkw\n\
+MTIwMzk1N1owFzEVMBMGA1UEAwwMbWNwZy10ZXN0LWNhMFkwEwYHKoZIzj0CAQYI\n\
+KoZIzj0DAQcDQgAEmuOrY8CLXKq8f3BGgSeugoQtwMfkzdztxUX8gRbjXlAdo9CP\n\
+Q6mPxFwwVJa6vkSUagc4XMFTwPR0XKXnyRSeYqNTMFEwHQYDVR0OBBYEFIkT1jxH\n\
+2Q1g1AuYGYCNCSn2ItU2MB8GA1UdIwQYMBaAFIkT1jxH2Q1g1AuYGYCNCSn2ItU2\n\
+MA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSQAwRgIhAL5syMJr7h2NAxJW\n\
+Os4yEYf81h/OzOGhG6SHRFnkeaiSAiEAjxmd81w+EdoDmzCJrBrZBFklpK4K5rkb\n\
+sEkUiIkzAWo=\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn parses_tls_block_with_rediss_url() {
+        let cfg = RedisBackendConfig::parse(
+            &json!({"url": "rediss://r:6380", "tls": {"ca_cert": TEST_CA_PEM}}).to_string(),
+        )
+        .unwrap();
+        let pem = cfg
+            .tls_root_cert_pem()
+            .expect("inline PEM resolves")
+            .expect("ca_cert set");
+        assert_eq!(pem, TEST_CA_PEM.as_bytes());
+    }
+
+    #[test]
+    fn rediss_without_tls_block_uses_system_roots() {
+        // A bare `rediss://` URL is valid on its own — no `tls` block
+        // needed; the connection then verifies against system roots.
+        let cfg =
+            RedisBackendConfig::parse(&json!({"url": "rediss://r:6380"}).to_string()).unwrap();
+        assert!(cfg.tls.is_none());
+        assert!(cfg.tls_root_cert_pem().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_tls_block_on_plaintext_scheme() {
+        let err =
+            RedisBackendConfig::parse(&json!({"url": "redis://r:6379", "tls": {}}).to_string())
+                .unwrap_err();
+        assert!(matches!(err, ConfigError::TlsRequiresTlsScheme));
+    }
+
+    #[test]
+    fn tls_ca_cert_path_resolves_file_and_missing_file_errors() {
+        let dir = std::env::temp_dir().join(format!("mcpg-redis-tls-{}", random_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ca.pem");
+        std::fs::write(&path, TEST_CA_PEM).unwrap();
+        let cfg = RedisBackendConfig::parse(
+            &json!({"url": "rediss://r:6380", "tls": {"ca_cert": path.to_str().unwrap()}})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tls_root_cert_pem().unwrap().unwrap(),
+            TEST_CA_PEM.as_bytes()
+        );
+        // A missing path parses (it is only a string) but fails
+        // resolution with a path-naming error.
+        let missing = dir.join("nope.pem");
+        let cfg = RedisBackendConfig::parse(
+            &json!({"url": "rediss://r:6380", "tls": {"ca_cert": missing.to_str().unwrap()}})
+                .to_string(),
+        )
+        .unwrap();
+        let err = cfg.tls_root_cert_pem().unwrap_err();
+        assert!(matches!(err, ConfigError::TlsFileRead { .. }), "{err}");
+        assert!(err.to_string().contains("nope.pem"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Redis `PUBLISH` only carries the channel name + an opaque
 //! payload. Operators who want a routing-key channel encode it in
 //! the wire envelope (see `envelope.rs`) — same shape as the
-//! consul + etcd coordinators.
+//! nats coordinator.
 //!
 //! - Topic → channel: `<prefix>topic:<topic>` (no wildcard for v0.1).
 //! - `publish_async`: encode + `PUBLISH`.

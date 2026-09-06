@@ -4,7 +4,7 @@
 //! per-message metadata channel for routing keys. So when an
 //! operator calls `publish(topic, Some("only-this"), b"hi")`, we
 //! have to round-trip the routing key inside `payload` itself.
-//! Identical wire shape to the consul + etcd coordinators.
+//! Identical wire shape to the nats coordinator.
 //!
 //! Format (little overhead, easy to parse, versioned):
 //!

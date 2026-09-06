@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-cluster-redis"
-version = "0.1.0-alpha.20"
+version = "0.1.0-alpha.23"
 license = "BUSL-1.1"
 edition = "2024"
 description = "Redis cluster_backend plugin for MCPG gateway (dev.mcpg.cluster.redis)"
@@ -9,14 +9,19 @@ description = "Redis cluster_backend plugin for MCPG gateway (dev.mcpg.cluster.r
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.18", version = "=0.1.0-beta.18" }
-mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-beta.18", version = "=0.1.0-beta.18" }
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.18", version = "=0.1.0-beta.18", features = ["cluster-forward"] }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.21", version = "=0.1.0-beta.21" }
+mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-beta.21", version = "=0.1.0-beta.21" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.21", version = "=0.1.0-beta.21", features = ["cluster-forward"] }
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = "0.3"
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
+# Direct dep purely to install a process-default CryptoProvider inside THIS
+# linkage unit: the workspace graph compiles rustls with both `ring` and
+# `aws-lc-rs`, so rustls refuses to auto-pick and panics on first use — and a
+# cdylib's rustls statics are its own, so the host binary's install can't help.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

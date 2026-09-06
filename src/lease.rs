@@ -2,9 +2,7 @@
 //!
 //! Redis doesn't have a native lease primitive — we get there via
 //! `SET NX PX` + a per-lease fence counter (`INCR`) + Lua scripts
-//! that compare-and-swap on the holder identity. The exact Lua
-//! shape is shared with `mcpg-state-redis::RedisLock` so an
-//! operator running both backends gets identical lease semantics.
+//! that compare-and-swap on the holder identity.
 //!
 //! - `acquire_*(key, ttl)` runs a Lua script that does
 //!   `SET NX PX ttl_ms` on the lease key + `INCR <key>:fence` on
@@ -16,7 +14,7 @@
 //! - **Release** is a Lua `if GET == holder then DEL`. Idempotent
 //!   via an `AtomicBool`; the renewal task aborts on drop.
 //!
-//! State lifecycle mirrors the etcd + consul plugins:
+//! State lifecycle mirrors the nats plugin:
 //! `Arc<LeaseState>` shared between async-trait holders and the
 //! FFI leaked pointer; sync renew/release borrow via
 //! `Arc::increment_strong_count`, the final `lease_drop` reclaims
@@ -231,7 +229,7 @@ pub(crate) async fn try_acquire_async(
 /// backoff until the backend hands us the lease.
 ///
 /// Backoff: 200 ms → 400 ms → 800 ms (clamped). Mirrors the
-/// consul plugin's tail; small enough to feel responsive, large
+/// nats plugin's tail; small enough to feel responsive, large
 /// enough to avoid hammering Redis when contention is high.
 pub(crate) async fn acquire_async(
     conn: SharedConn,
