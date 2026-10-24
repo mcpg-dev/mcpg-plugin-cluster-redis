@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-cluster-redis"
-version = "0.1.0-alpha.46"
+version = "0.1.0-alpha.47"
 license = "BUSL-1.1"
 edition = "2024"
 description = "Redis cluster_backend plugin for MCPG gateway (dev.mcpg.cluster.redis)"

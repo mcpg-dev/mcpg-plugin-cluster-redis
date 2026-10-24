@@ -81,6 +81,24 @@ pub(crate) async fn register_peer(
     Ok(())
 }
 
+/// `DEL <prefix>peers/<node_id>` — leave the peer list at shutdown, so the
+/// other replicas see this node gone now rather than after `peer_ttl_ms`.
+pub(crate) async fn deregister_peer(
+    conn: SharedConn,
+    prefix: &str,
+    node_id: &str,
+) -> Result<(), ClusterError> {
+    let key = peer_key(prefix, node_id);
+    let mut c = conn.lock().await;
+    let _: () = c
+        .del(&key)
+        .await
+        .map_err(|e| ClusterError::BackendUnavailable {
+            reason: format!("peer DEL `{key}`: {e}"),
+        })?;
+    Ok(())
+}
+
 /// `SCAN MATCH <prefix>peers/*` → `MGET` → JSON-decode → `ClusterPeer`.
 pub(crate) async fn list_peers(
     conn: SharedConn,

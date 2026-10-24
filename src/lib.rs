@@ -696,9 +696,25 @@ impl SyncClusterBackend for RedisBackend {
     /// Proactively abort the peer-refresh background task within the
     /// host's drain window rather than waiting for `Drop` (which fires
     /// only when the last `Arc<Inner>` ref — possibly an outstanding
-    /// lease/stream guard — is released).
+    /// lease/stream guard — is released), then leave the peer list.
     fn shutdown(&self) {
+        let registered = self.inner.peer_refresh_abort.lock().unwrap().is_some();
         self.inner.shutdown();
+        let Some(conn) = self.inner.conn_cell.get().cloned().filter(|_| registered) else {
+            return;
+        };
+        let left = self.inner.runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                peer::deregister_peer(conn, &self.inner.config.key_prefix, &self.inner.node_id),
+            )
+            .await
+        });
+        if !matches!(left, Ok(Ok(()))) {
+            tracing::warn!(
+                "redis cluster: peer key not deleted at shutdown; peers expire this node"
+            );
+        }
     }
 
     fn node_info(&self) -> ClusterNodeInfo {
