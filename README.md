@@ -16,8 +16,22 @@ cluster the gateway.
   `Lease`, and `Watch` — over one shared connection manager.
 - Issues leases and leadership with monotonically increasing fence tokens, and
   renews them from a background task before they expire.
-- Registers this replica under a TTL'd presence key and refreshes it in the
-  background, so a dead replica disappears from peer listings on its own.
+- Registers this replica under a TTL'd presence key and in the sorted set
+  `<key_prefix>#peers` (scored by expiry), and refreshes both in the
+  background, so a dead replica disappears from peer listings on its own. A
+  peer list is a range read of the set, not a scan of the keyspace; registrations
+  of older builds (outside the set) are found by a scan at most every
+  `min(30 s, peer_ttl_ms)`.
+- Runs every key/value write as one Lua script that also updates a key index
+  (`<key_prefix>#kv-index`, a lex-ordered sorted set) and an expiry index
+  (`<key_prefix>#kv-expiry`), so a prefix listing is `ZRANGEBYLEX` plus one
+  pipelined `GET`/`PTTL` — its cost follows what it matches. Operations run
+  concurrently over the multiplexed connection. One replica at a time (the
+  `mcpg-kv-sweep` lock) drops the index entries of expired keys every
+  `kv_sweep_interval_ms`. While a peer of an older build is registered (no
+  `kv_index` in its registration), listings scan the keyspace as before; the
+  lock holder backfills the index once no such peer has been seen for
+  `peer_ttl_ms`.
 - Declares `provides: [cache, kv]`, so gateway capabilities that need a shared
   cache or key/value store inherit those primitives without further wiring;
   capability buses inherit its `pub_sub()` accessor the same way.
@@ -73,6 +87,7 @@ plugins:
 | `lease_renew_before_expiry_percent` | u32 | `80` | Renewal fires after `ttl × (100 − pct) / 100`; clamped to `[1, 99]`. |
 | `peer_refresh_interval_ms` | u64? | `peer_ttl_ms / 2` | Cadence of background peer re-registration. |
 | `subscribe_pattern_buffer` | usize | `256` | Channel buffer feeding subscriber and peer-event streams; must be > 0. |
+| `kv_sweep_interval_ms` | u64 | `30000` | Cadence of the key-index sweep; `0` turns sweeping off (the index gate still runs every 30 s). |
 
 Unknown fields are rejected.
 
@@ -87,9 +102,11 @@ deterministic identities across restarts.
 |---|---|
 | `acquire_lock` / `acquire_leadership` | Lua `SET NX PX` plus `INCR` on a sibling `:fence` key; renewal re-checks the holder before `PEXPIRE` |
 | `publish` / `subscribe` | native `PUBLISH` / `SUBSCRIBE` on the channel `<key_prefix>topic:<topic>`; the routing key travels in the message envelope |
-| key/value `get` / `put` / `delete` / prefix scan | `GET` / `SET` / `DEL` / `SCAN` |
+| key/value `get` | pipelined `GET` + `PTTL` |
+| key/value `put` / `put_if_absent` / `delete` / `expire` / `incr` | one Lua script each, over the data key and the two indexes |
+| key/value prefix listing | `ZRANGEBYLEX <key_prefix>#kv-index` + pipelined `GET`/`PTTL`; `SCAN` while an older build is registered |
 | key-change `watch` | a Redis Stream the matching key/value store appends to on every write, consumed with `XREAD BLOCK` and filtered by prefix |
-| `list_peers` | `SCAN MATCH <key_prefix>peers/*` followed by `MGET` |
+| `list_peers` | `ZRANGEBYSCORE <key_prefix>#peers` followed by `MGET` |
 | `watch_peers` | polled diff of successive `list_peers` snapshots |
 
 At boot the gateway probes every primitive this coordinator advertises with a

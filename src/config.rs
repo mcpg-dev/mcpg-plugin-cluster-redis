@@ -79,6 +79,12 @@ pub struct RedisBackendConfig {
     /// configured.
     #[serde(default = "default_service_name")]
     pub service_name: String,
+
+    /// Milliseconds between two sweeps of the state store's key index
+    /// (dropping the entries of expired keys). One replica sweeps at a
+    /// time (a lease). Default 30000; `0` turns sweeping off.
+    #[serde(default = "default_kv_sweep_interval_ms")]
+    pub kv_sweep_interval_ms: u64,
 }
 
 /// TLS knobs for `rediss://` URLs. Mirrors the nats coordinator
@@ -127,6 +133,7 @@ impl std::fmt::Debug for RedisBackendConfig {
             .field("peer_refresh_interval_ms", &self.peer_refresh_interval_ms)
             .field("subscribe_pattern_buffer", &self.subscribe_pattern_buffer)
             .field("service_name", &self.service_name)
+            .field("kv_sweep_interval_ms", &self.kv_sweep_interval_ms)
             .finish()
     }
 }
@@ -180,6 +187,10 @@ fn default_subscribe_pattern_buffer() -> usize {
 
 fn default_service_name() -> String {
     "mcpg".into()
+}
+
+fn default_kv_sweep_interval_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Error)]

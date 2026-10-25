@@ -21,9 +21,9 @@
 //! |---|---|
 //! | `acquire_lock` / `acquire_leadership` | Lua `SET NX PX` + `INCR` for fence; renew via `if GET == holder then PEXPIRE` |
 //! | `publish` / `subscribe`               | Native `PUBLISH` / `SUBSCRIBE` |
-//! | `key_value_store()`                   | GET/SET/DEL/SCAN + `INCRBY` (atomic `incr`) |
+//! | `key_value_store()`                   | One Lua script per write (data key + key index + expiry index); listings `ZRANGEBYLEX` the key index |
 //! | `pub_sub()`                           | `PUBLISH` / `PSUBSCRIBE` (broadcast; queue group ignored) |
-//! | `list_peers`                          | `SCAN MATCH <prefix>peers/*` + `MGET` |
+//! | `list_peers`                          | `ZRANGEBYSCORE <prefix>#peers` + `MGET` (a `SCAN` at most every 30 s for older builds) |
 //! | `watch_peers`                         | Polling diff against `list_peers` snapshots |
 //!
 //! TLS: a `rediss://` URL connects over rustls — system trust roots by
@@ -37,6 +37,7 @@
 mod config;
 mod envelope;
 mod lease;
+mod maintenance;
 mod peer;
 mod pubsub;
 mod state;
@@ -97,6 +98,11 @@ struct Inner {
     primitives: OnceCell<RedisPrimitives>,
     runtime: Runtime,
     peer_refresh_abort: StdMutex<Option<AbortHandle>>,
+    /// The state-store sweep and key-index gate (see [`maintenance`]).
+    kv_maintenance_abort: StdMutex<Option<AbortHandle>>,
+    /// Registrations of peers outside the sorted peer set, from the last
+    /// keyspace scan.
+    peer_scan: peer::LegacyPeerScan,
     /// Set by `shutdown()` so the coordinator's background tasks are torn
     /// down proactively within the host's drain window instead of only on
     /// `Drop` (which fires when the last `Arc` ref — possibly an
@@ -111,6 +117,9 @@ impl Inner {
         self.draining
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(h) = self.peer_refresh_abort.lock().unwrap().take() {
+            h.abort();
+        }
+        if let Some(h) = self.kv_maintenance_abort.lock().unwrap().take() {
             h.abort();
         }
     }
@@ -224,6 +233,7 @@ impl RedisBackend {
         };
 
         let node_id = cfg.resolved_node_id();
+        let peer_scan = peer::LegacyPeerScan::new(Duration::from_millis(cfg.peer_ttl_ms));
         let started_at = now_rfc3339();
         let url_for_log = crate::config::redact_redis_url(&cfg.url);
         let key_prefix_for_log = cfg.key_prefix.clone();
@@ -262,6 +272,8 @@ impl RedisBackend {
             primitives: OnceCell::new(),
             runtime,
             peer_refresh_abort: StdMutex::new(None),
+            kv_maintenance_abort: StdMutex::new(None),
+            peer_scan,
             draining: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -311,6 +323,12 @@ impl RedisBackend {
         });
         *inner.peer_refresh_abort.lock().unwrap() = Some(peer_refresh_abort);
 
+        let maintenance_inner = Arc::clone(&inner);
+        let maintenance_abort = inner
+            .runtime
+            .block_on(async move { maintenance::spawn(maintenance_inner) });
+        *inner.kv_maintenance_abort.lock().unwrap() = Some(maintenance_abort);
+
         tracing::info!(
             plugin_id = PLUGIN_ID,
             url = %url_for_log,
@@ -327,6 +345,62 @@ impl RedisBackend {
     /// caller can decide whether to retry.
     async fn get_or_init_conn(&self) -> Result<lease::SharedConn, ClusterError> {
         get_or_init_conn(&self.inner).await
+    }
+
+    /// The state store, once the connection is up.
+    fn require_redis_kv(&self) -> Result<Arc<RedisKv>, ClusterError> {
+        self.inner
+            .runtime
+            .block_on(async { get_or_init_conn(&self.inner).await })?;
+        self.inner
+            .primitives
+            .get()
+            .map(|p| Arc::clone(&p.kv))
+            .ok_or_else(|| ClusterError::BackendUnavailable {
+                reason: "redis cluster: key_value_store unavailable".into(),
+            })
+    }
+
+    /// Drop the key-index entries of expired keys now, whether or not this
+    /// instance holds the sweep lock. Returns how many keys were gone.
+    pub fn sweep_state(&self) -> Result<u64, ClusterError> {
+        let kv = self.require_redis_kv()?;
+        self.inner.runtime.block_on(async { kv.sweep().await })
+    }
+
+    /// Index every live key and let listings read the index, as the sweep
+    /// lock holder does once no peer without the index is registered.
+    /// Refused while one is. Returns the keys indexed.
+    pub fn complete_key_index(&self) -> Result<u64, ClusterError> {
+        let kv = self.require_redis_kv()?;
+        self.inner.runtime.block_on(async {
+            let conn = get_or_init_conn(&self.inner).await?;
+            self.inner.peer_scan.forget().await;
+            let registrations = peer::list_registrations(
+                conn,
+                &self.inner.config.key_prefix,
+                &self.inner.peer_scan,
+            )
+            .await?;
+            if registrations.iter().any(|(_, reg)| !reg.kv_index) {
+                return Err(ClusterError::Precondition {
+                    reason: "a peer that does not write the key index is registered".into(),
+                });
+            }
+            let started_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let indexed = kv.backfill_index().await?;
+            kv.mark_index_complete(started_at_ms).await?;
+            kv.set_index_ready(true);
+            Ok(indexed)
+        })
+    }
+
+    /// Whether listings read the key index now.
+    pub fn key_index_ready(&self) -> Result<bool, ClusterError> {
+        Ok(self.require_redis_kv()?.index_ready())
     }
 
     /// Resolve the live `KeyValueStore`, lazily establishing the connection
@@ -478,7 +552,7 @@ impl ClusterBackend for RedisBackend {
                 return vec![];
             }
         };
-        match peer::list_peers(conn, &self.inner.config.key_prefix).await {
+        match peer::list_peers(conn, &self.inner.config.key_prefix, &self.inner.peer_scan).await {
             Ok(peers) => peers,
             Err(err) => {
                 tracing::warn!(
@@ -522,7 +596,7 @@ impl ClusterBackend for RedisBackend {
                         continue;
                     }
                 };
-                match peer::list_peers(conn, &prefix).await {
+                match peer::list_peers(conn, &prefix, &inner.peer_scan).await {
                     Ok(peers) => {
                         let cur: std::collections::BTreeMap<String, ClusterPeer> = peers
                             .into_iter()
@@ -919,15 +993,16 @@ impl SyncClusterBackend for RedisBackend {
         self.inner.runtime.block_on(async { kv.delete(key).await })
     }
 
-    fn kv_list_prefix(
+    fn kv_list_page(
         &self,
         prefix: &str,
+        cursor: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, ClusterError> {
+    ) -> Result<mcpg_cluster_api::KvPage, ClusterError> {
         let kv = self.require_kv()?;
         self.inner
             .runtime
-            .block_on(async { kv.list_prefix(prefix, limit).await })
+            .block_on(async { kv.list_page(prefix, cursor, limit).await })
     }
 
     fn kv_expire(&self, key: &str, ttl_ms: Option<u64>) -> Result<bool, ClusterError> {
