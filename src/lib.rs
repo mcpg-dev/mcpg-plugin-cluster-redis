@@ -1018,6 +1018,23 @@ impl SyncClusterBackend for RedisBackend {
             .runtime
             .block_on(async { kv.incr(key, delta, ttl_from_ms(ttl_ms)).await })
     }
+
+    fn declares_kv_incr_floor(&self) -> bool {
+        true
+    }
+
+    fn kv_incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl_ms: Option<u64>,
+    ) -> Result<i64, ClusterError> {
+        let kv = self.require_kv()?;
+        self.inner
+            .runtime
+            .block_on(async { kv.incr_floor(key, delta, floor, ttl_from_ms(ttl_ms)).await })
+    }
 }
 
 /// Whole-millisecond TTL → `Duration` (None == no TTL).

@@ -85,6 +85,41 @@ redis.call('ZADD', KEYS[2], 0, KEYS[1])
 return ret
 ";
 
+/// `incr_floor`: raise the counter to at least the floor, then add, as one
+/// `INCRBY` of the difference, with the same TTL and index steps as
+/// [`INCR_LUA`]. Lua computes with doubles, exact below 2^53 (a microsecond
+/// clock is about 1.8e15), so an operand at or past it is refused rather
+/// than rounded. ARGV: delta, ttl ms (0 = keep), now ms, floor.
+const INCR_FLOOR_LUA: &str = r"
+local exact = 9007199254740992
+local raw = redis.call('GET', KEYS[1])
+local current = 0
+if raw then current = tonumber(raw) end
+local delta = tonumber(ARGV[1])
+local floor = tonumber(ARGV[4])
+if current == nil then
+  return redis.error_reply('MCPG_KV_INCR_PRECONDITION: incr target holds a non-integer value')
+end
+if math.abs(current) >= exact or math.abs(floor) >= exact or math.abs(delta) >= exact then
+  return redis.error_reply('MCPG_KV_INCR_PRECONDITION: incr_floor operand beyond 2^53')
+end
+local base = current
+if base < floor then base = floor end
+local ok, ret = pcall(redis.call, 'INCRBY', KEYS[1], string.format('%.0f', base - current + delta))
+if not ok then
+  local detail = ''
+  if type(ret) == 'table' and ret.err then detail = ': ' .. ret.err end
+  return redis.error_reply('MCPG_KV_INCR_PRECONDITION' .. detail)
+end
+local ttl = tonumber(ARGV[2])
+if ttl and ttl > 0 then
+  redis.call('PEXPIRE', KEYS[1], ttl)
+  redis.call('ZADD', KEYS[3], tonumber(ARGV[3]) + ttl, KEYS[1])
+end
+redis.call('ZADD', KEYS[2], 0, KEYS[1])
+return ret
+";
+
 /// Drop the index entries of the keys in ARGV that are gone. KEYS: key
 /// index, expiry index. Returns how many were dropped.
 const PRUNE_LUA: &str = r"
@@ -143,6 +178,8 @@ static SET_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new
 static DEL_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(DEL_LUA));
 static EXPIRE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(EXPIRE_LUA));
 static INCR_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(INCR_LUA));
+static INCR_FLOOR_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(INCR_FLOOR_LUA));
 static PRUNE_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(PRUNE_LUA));
 static SWEEP_SCRIPT: LazyLock<redis::Script> = LazyLock::new(|| redis::Script::new(SWEEP_LUA));
 static BACKFILL_SCRIPT: LazyLock<redis::Script> =
@@ -630,16 +667,40 @@ impl KeyValueStore for RedisKv {
             .arg(now_ms())
             .invoke_async(&mut self.conn())
             .await;
-        r.map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("MCPG_KV_INCR_PRECONDITION") {
-                ClusterError::Precondition {
-                    reason: format!("redis incr `{key}`: {msg}"),
-                }
-            } else {
-                redis_err(e)
-            }
-        })
+        r.map_err(|e| incr_err("incr", key, e))
+    }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        let r: Result<i64, redis::RedisError> = INCR_FLOOR_SCRIPT
+            .key(self.full_key(key))
+            .key(&self.inner.index_key)
+            .key(&self.inner.expiry_key)
+            .arg(delta)
+            .arg(Self::ttl_ms(ttl))
+            .arg(now_ms())
+            .arg(floor)
+            .invoke_async(&mut self.conn())
+            .await;
+        r.map_err(|e| incr_err("incr_floor", key, e))
+    }
+}
+
+/// A counter script's error: its precondition sentinel is a
+/// [`ClusterError::Precondition`], anything else the backend's.
+fn incr_err(op: &str, key: &str, e: redis::RedisError) -> ClusterError {
+    let msg = e.to_string();
+    if msg.contains("MCPG_KV_INCR_PRECONDITION") {
+        ClusterError::Precondition {
+            reason: format!("redis {op} `{key}`: {msg}"),
+        }
+    } else {
+        redis_err(e)
     }
 }
 
